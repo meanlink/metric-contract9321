@@ -100,6 +100,36 @@ def _divide(left, right, policy, warnings):
     return value, unit
 
 
+def _r4(value):
+    return None if value is None else round(float(value), 4)
+
+
+def _week_label(day):
+    year, week, _ = day.isocalendar()
+    return f"{year}-W{week:02}"
+
+
+def _align(rows, key, target):
+    """Put the 4-decimal rounding residual on the largest row so the column visibly adds up."""
+    present = [row for row in rows if isinstance(row.get(key), (int, float))]
+    if not present:
+        return
+    observed = round(sum(row[key] for row in present), 4)
+    residual = round(round(target, 4) - observed, 4)
+    if residual:
+        pivot = max(present, key=lambda row: abs(row[key]))
+        pivot[key] = round(pivot[key] + residual, 4)
+
+
+def _row_breakdown(row, numerator):
+    return {
+        "gross": _r4(sum(r["gross"] for r in row)), "refunds": _r4(sum(r["refunds"] for r in row)),
+        "discount": _r4(sum(r["discount"] for r in row)), "visits": int(sum(r["visits"] for r in row)),
+        "computed_amount": _r4(numerator), "source_amount": _r4(sum(r["recognized_net"] for r in row)),
+        "amount_difference": _r4(numerator - sum(r["recognized_net"] for r in row)),
+    }
+
+
 def analyze(records, params):
     if not isinstance(records, list) or not records:
         raise ValueError("请先导入渠道日汇总账")
@@ -119,8 +149,10 @@ def analyze(records, params):
             values = {key: float(record[key]) for key in FIELDS}
         except (KeyError, TypeError, ValueError):
             raise ValueError("源账缺少日期、渠道、币种或注册数值字段") from None
-        if not channel or not all(math.isfinite(value) and 0 <= value <= 1_000_000_000 for value in values.values()):
-            raise ValueError("渠道不能为空，单行金额和访问数必须为0至10亿之间的有限数值")
+        # 毛额/退款/折扣/访问是流量约束，不能为负；源账认可净额允许为负，便于暴露退款倒挂。
+        non_negative = all(math.isfinite(values[key]) and 0 <= values[key] <= 1_000_000_000 for key in ("gross", "refunds", "discount", "visits"))
+        if not channel or not non_negative or not (math.isfinite(values["recognized_net"]) and -1_000_000_000 <= values["recognized_net"] <= 1_000_000_000):
+            raise ValueError("渠道不能为空；毛额、退款、折扣和访问数须为0至10亿的有限数值，源账认可净额允许为负但须在±10亿内")
         if not values["visits"].is_integer():
             raise ValueError("访问数必须为整数，不能提交已经平均化的分母")
         key = (day, channel)
@@ -128,42 +160,215 @@ def analyze(records, params):
             raise ValueError("渠道日自然键重复，请先完成源账去重")
         natural_keys.add(key)
         currencies.add(currency)
-        values.update({"day": day, "channel": channel})
+        values.update({"day": day, "channel": channel, "week": _week_label(day)})
         rows.append(values)
     if currencies != {"CNY"}:
         raise ValueError("当前口径只接受统一CNY，混合或其他币种请先换算")
     warnings = []
-    total, unit = _evaluate(tree, rows, zero_policy, warnings)
+    total_metric, unit = _evaluate(tree, rows, zero_policy, warnings)
     if unit not in ("CNY", "CNY/visit"):
         raise ValueError("当前对账契约只接受净收入CNY或单次访问净收入CNY/visit")
-    groups = {}
-    for row in rows:
-        if grouping == "channel":
-            key = row["channel"]
-        else:
-            year, week, _ = row["day"].isocalendar()
-            key = f"{year}-W{week:02}"
-        groups.setdefault(key, []).append(row)
-    output = []
-    for key, group in sorted(groups.items()):
-        value, group_unit = _evaluate(tree, group, zero_policy, warnings)
-        if group_unit != unit:
-            raise ValueError("分组间口径单位不一致")
-        source = sum(row["recognized_net"] for row in group)
-        if unit == "CNY/visit":
-            source = _divide((source, "CNY"), (sum(row["visits"] for row in group), "visit"), zero_policy, warnings)[0]
-        output.append({"dimension": key, "computed": round(value, 4), "source": round(source, 4), "difference": round(value-source, 4), "visits": int(sum(row["visits"] for row in group))})
-    source_total = sum(row["recognized_net"] for row in rows)
-    if unit == "CNY/visit":
-        source_total = _divide((source_total, "CNY"), (sum(row["visits"] for row in rows), "visit"), zero_policy, warnings)[0]
-    if not all(math.isfinite(value) for value in (total, source_total)):
+    ratio_mode = unit == "CNY/visit"
+    if ratio_mode:
+        if not (isinstance(tree, ast.Call) and isinstance(tree.func, ast.Name) and tree.func.id == "ratio" and len(tree.args) == 2):
+            raise ValueError("单次访问口径需使用顶层 ratio(金额,访问) 结构，才能拆分金额差额与总比率贡献")
+        amount_node, denominator_node = tree.args
+        amount_total, amount_unit = _evaluate(amount_node, rows, zero_policy, warnings)
+        denominator_total, denominator_unit = _evaluate(denominator_node, rows, zero_policy, warnings)
+        if amount_unit != "CNY" or denominator_unit != "visit":
+            raise ValueError("ratio 的分子必须是CNY金额，分母必须是访问数")
+    else:
+        amount_node, denominator_node = tree, None
+        amount_total, denominator_total = total_metric, None
+    source_amount_total = sum(row["recognized_net"] for row in rows)
+    total_amount_difference = amount_total - source_amount_total
+    if ratio_mode:
+        source_metric_total = 0.0 if denominator_total == 0 else source_amount_total / denominator_total
+    else:
+        source_metric_total = source_amount_total
+    if not all(math.isfinite(value) for value in (total_metric, source_metric_total, amount_total, source_amount_total)):
         raise ValueError("指标结果非有限值，请缩小数值范围或修复口径")
-    discrepancy = total - source_total
+    discrepancy = total_metric - source_metric_total
+
+    def contributions(amount_difference):
+        if not ratio_mode:
+            return amount_difference
+        if not denominator_total:
+            # 总访问为0且按显式记0策略执行：整列比率无定义，贡献统一记0并保留警告。
+            return 0.0
+        return amount_difference / denominator_total
+
+    def build(keyfunc, with_metric, strict):
+        groups = {}
+        for row in rows:
+            groups.setdefault(keyfunc(row), []).append(row)
+        output = []
+        for key in sorted(groups):
+            group = groups[key]
+            numerator, group_unit = _evaluate(amount_node, group, zero_policy, warnings)
+            if group_unit != "CNY":
+                raise ValueError("分组间金额单位不一致")
+            item = _row_breakdown(group, numerator)
+            if isinstance(key, tuple):
+                item.update({"channel": key[0], "week": key[1], "dimension": f"{key[0]} · {key[1]}"})
+            elif keyfunc is _week_key:
+                item["week"] = key
+            else:
+                item["channel"] = key
+            if not isinstance(key, tuple):
+                item["dimension"] = key
+            if ratio_mode and with_metric:
+                # 分层下钻用该组自身分母；只有主汇总层（strict）保留注册的零分母拒绝契约，
+                # 交叉层出现零访问时标记为无定义而不是让整次对账失败。
+                group_denominator = float(_evaluate(denominator_node, group, "zero", [])[0])
+                item["denominator"] = _r4(group_denominator)
+                if group_denominator == 0:
+                    if strict:
+                        computed, _ = _divide((numerator, "CNY"), (0.0, "visit"), zero_policy, warnings)
+                    else:
+                        computed = 0.0 if zero_policy == "zero" else None
+                    item["computed_metric"] = _r4(computed)
+                    item["source_metric"] = _r4(computed)
+                    item["local_difference"] = _r4(computed)
+                else:
+                    item["computed_metric"] = _r4(numerator / group_denominator)
+                    item["source_metric"] = _r4(item["source_amount"] / group_denominator)
+                    item["local_difference"] = _r4(item["computed_metric"] - item["source_metric"])
+            elif with_metric:
+                item["denominator"] = None
+                item["computed_metric"] = item["computed_amount"]
+                item["source_metric"] = item["source_amount"]
+                item["local_difference"] = item["amount_difference"]
+            output.append(item)
+        _align(output, "amount_difference", total_amount_difference)
+        if ratio_mode:
+            for item in output:
+                item["contribution"] = _r4(contributions(item["amount_difference"]))
+            _align(output, "contribution", discrepancy)
+        else:
+            for item in output:
+                item["contribution"] = item["amount_difference"]
+        for item in output:
+            item["share"] = None if not discrepancy else _r4(item["contribution"] / discrepancy)
+        return output
+
+    def _week_key(row):
+        return row["week"]
+
+    channel_rows = build(lambda row: row["channel"], True, grouping == "channel")
+    week_rows = build(_week_key, True, grouping == "week")
+    cross_rows = build(lambda row: (row["channel"], row["week"]), True, False)
+
+    ledger = []
+    for row in rows:
+        numerator = float(_evaluate(amount_node, [row], zero_policy, warnings)[0])
+        item = {
+            "day": str(row["day"]), "week": row["week"], "channel": row["channel"],
+            "gross": _r4(row["gross"]), "refunds": _r4(row["refunds"]), "discount": _r4(row["discount"]),
+            "visits": int(row["visits"]), "computed_amount": _r4(numerator),
+            "source_amount": _r4(row["recognized_net"]), "amount_difference": _r4(numerator - row["recognized_net"]),
+        }
+        item["contribution"] = _r4(contributions(item["amount_difference"]))
+        notes = []
+        if row["visits"] == 0:
+            notes.append("零访问：金额差额计入分子，但不增加分母")
+        if item["computed_amount"] < 0 or item["source_amount"] < 0:
+            notes.append("负净收入：退款与折扣超过毛额或源账为负，未按0截断")
+        if item["amount_difference"] > 0:
+            notes.append("源账低于统一口径，需回查额外扣减")
+        elif item["amount_difference"] < 0:
+            notes.append("源账高于统一口径")
+        item["note"] = "；".join(notes) or "无差异"
+        ledger.append(item)
+    _align(ledger, "amount_difference", total_amount_difference)
+    if ratio_mode:
+        for item in ledger:
+            item["contribution"] = _r4(contributions(item["amount_difference"]))
+        _align(ledger, "contribution", discrepancy)
+    else:
+        for item in ledger:
+            item["contribution"] = item["amount_difference"]
+
+    zero_rows = [item for item in ledger if item["visits"] == 0]
+    negative_rows = [item for item in ledger if item["computed_amount"] < 0 or item["source_amount"] < 0]
+    zero_groups = [item for item in cross_rows if item["visits"] == 0]
+    contribution_sum = round(sum(item["contribution"] for item in ledger if item["contribution"] is not None), 4)
+    amount_sum = round(sum(item["amount_difference"] for item in ledger), 4)
+    target_contribution = round(discrepancy, 4)
+    target_amount = round(total_amount_difference, 4)
+
+    column_sets = {
+        "channel": [{"key": "dimension", "label": "渠道"}, {"key": "gross", "label": "含折扣前收入"}, {"key": "refunds", "label": "退款"}, {"key": "discount", "label": "折扣"}, {"key": "visits", "label": "有效访问（分母）"}, {"key": "computed_amount", "label": "统一口径金额"}, {"key": "source_amount", "label": "源账认可金额"}, {"key": "amount_difference", "label": "金额差额"}, {"key": "computed_metric", "label": "统一口径单次净收入"}, {"key": "source_metric", "label": "源账单次净收入"}, {"key": "local_difference", "label": "组内单次差额（不可相加）"}, {"key": "contribution", "label": "对总差额贡献"}],
+        "week": [{"key": "dimension", "label": "自然周"}, {"key": "gross", "label": "含折扣前收入"}, {"key": "refunds", "label": "退款"}, {"key": "discount", "label": "折扣"}, {"key": "visits", "label": "有效访问（分母）"}, {"key": "computed_amount", "label": "统一口径金额"}, {"key": "source_amount", "label": "源账认可金额"}, {"key": "amount_difference", "label": "金额差额"}, {"key": "computed_metric", "label": "统一口径单次净收入"}, {"key": "source_metric", "label": "源账单次净收入"}, {"key": "local_difference", "label": "组内单次差额（不可相加）"}, {"key": "contribution", "label": "对总差额贡献"}],
+        "cross": [{"key": "channel", "label": "渠道"}, {"key": "week", "label": "自然周"}, {"key": "gross", "label": "含折扣前收入"}, {"key": "refunds", "label": "退款"}, {"key": "discount", "label": "折扣"}, {"key": "visits", "label": "有效访问（分母）"}, {"key": "computed_amount", "label": "统一口径金额"}, {"key": "source_amount", "label": "源账认可金额"}, {"key": "amount_difference", "label": "金额差额"}, {"key": "computed_metric", "label": "统一口径单次净收入"}, {"key": "source_metric", "label": "源账单次净收入"}, {"key": "contribution", "label": "对总差额贡献"}],
+        "ledger": [{"key": "day", "label": "日期"}, {"key": "week", "label": "自然周"}, {"key": "channel", "label": "渠道"}, {"key": "gross", "label": "含折扣前收入"}, {"key": "refunds", "label": "退款"}, {"key": "discount", "label": "折扣"}, {"key": "visits", "label": "有效访问"}, {"key": "computed_amount", "label": "统一口径金额"}, {"key": "source_amount", "label": "源账认可金额"}, {"key": "amount_difference", "label": "金额差额"}, {"key": "contribution", "label": "对总差额贡献"}, {"key": "note", "label": "追溯说明"}],
+    }
+    if not ratio_mode:
+        for columns in column_sets.values():
+            for column in columns:
+                if column["key"] == "computed_metric":
+                    column["label"] = "统一口径净收入"
+                elif column["key"] == "source_metric":
+                    column["label"] = "源账认可净收入"
+                elif column["key"] == "local_difference":
+                    column["label"] = "组内金额差额"
+                elif column["key"] == "contribution":
+                    column["label"] = "对总差额贡献（同金额差额）"
+
+    tables = {
+        "channel": {"key": "channel", "title": "按渠道追溯", "note": "各渠道金额差额与贡献；单次差额仅用于组内解释，不能直接相加。", "columns": column_sets["channel"], "rows": channel_rows},
+        "week": {"key": "week", "title": "按自然周追溯", "note": "自然周为ISO周（周一至周日）；跨渠道合并后同样保留收入、退款、折扣与访问分母。", "columns": column_sets["week"], "rows": week_rows},
+        "cross": {"key": "cross", "title": "渠道 × 自然周交叉追溯", "note": "交叉行是源账最细的可复核汇总层；每行贡献合计等于总差额。", "columns": column_sets["cross"], "rows": cross_rows},
+        "ledger": {"key": "ledger", "title": "源账逐行追溯", "note": "逐行列出源账日期、渠道与自然周，直接定位造成差额的原始记录。", "columns": column_sets["ledger"], "rows": ledger},
+    }
+    order = ["week", "channel"] if grouping == "week" else ["channel", "week"]
+    order += ["cross", "ledger"]
+    table_list = [tables[key] for key in order]
+
+    primary_label = "渠道" if grouping == "channel" else "自然周"
+    zero_explanation = (
+        "本次源账没有零访问记录。" if not zero_rows else
+        f"有 {len(zero_rows)} 条零访问记录：这些行的收入、退款、折扣仍计入金额分子，但不增加访问分母，"
+        "因此会抬高或拉低整体单次净收入；其单次指标无定义，组内访问合计为0时该组单次指标也无定义。"
+        f"当前零分母策略为{'阻止计算并修复' if zero_policy == 'reject' else '明确记0并警告'}。"
+    )
+    negative_explanation = (
+        "本次源账没有负净收入记录。" if not negative_rows else
+        f"有 {len(negative_rows)} 条负净收入记录：退款与折扣超过毛额，或源账认可净额为负。"
+        "结果按实际负值参与汇总，未按0截断，也不能把负的单次净收入解释为增长。"
+    )
+    findings = [
+        f"执行公式：{expression}；单位契约：{unit}；零分母策略：{zero_policy}。",
+        "单次访问净收入下，各渠道自身的单次差额不能相加（分母不同）。可加的是金额差额，以及对总比率差额的贡献＝组金额差额÷总访问分母；本结果明细贡献合计与总差额一致。"
+        if ratio_mode else "金额口径下，对总差额的贡献就是金额差额；渠道、自然周、交叉与源账逐行四个层级的贡献合计均与总差额一致。",
+        "模拟种子的合作渠道额外扣减1.8%服务费，用于展示一种可解释差异；差额本身仍须回查原账，不代表审计结论。",
+        zero_explanation,
+        negative_explanation,
+        "展示值保留4位小数，四舍五入尾差统一落在贡献绝对值最大的一行，因此明细相加与总差额在展示精度上完全一致。",
+    ]
+    contribution_consistent = contribution_sum == target_contribution
+    amount_consistent = amount_sum == target_amount
+    summary = (
+        f"按{primary_label}对账{len(rows)}行；统一口径{total_metric:,.4f}{unit}，源账认可{source_metric_total:,.4f}{unit}，"
+        f"总差额{discrepancy:+,.4f}{unit}；明细贡献合计{contribution_sum:+,.4f}{unit}（{'一致' if contribution_consistent else '不一致'}）。"
+        f"零访问{len(zero_rows)}行，负净收入{len(negative_rows)}行。"
+    )
     return {
-        "summary": f"按{'渠道' if grouping=='channel' else '自然周'}对账{len(rows)}行；统一口径{total:,.4f}{unit}，与源账认可值差额{discrepancy:+,.4f}{unit}。",
-        "metrics": [{"label": "统一口径", "value": round(total, 4), "unit": unit}, {"label": "源账认可", "value": round(source_total, 4), "unit": unit}, {"label": "口径差额", "value": round(discrepancy, 4), "unit": unit}, {"label": "差异分组", "value": sum(abs(row["difference"]) > 0.01 for row in output), "unit": "组"}],
-        "table": {"columns": [{"key": "dimension", "label": "对账维度"}, {"key": "computed", "label": "统一口径值"}, {"key": "source", "label": "源账认可值"}, {"key": "difference", "label": "差额"}, {"key": "visits", "label": "访问分母"}], "rows": output},
-        "chart": {"type": "bar", "labels": [row["dimension"] for row in output], "series": [{"name": "统一口径", "values": [row["computed"] for row in output]}, {"name": "源账认可", "values": [row["source"] for row in output]}]},
-        "findings": [f"执行公式：{expression}；单位契约：{unit}；零分母策略：{zero_policy}。", "差额仅表示所选口径与源账认可值不一致，须回查原账。模拟种子的合作渠道额外扣减1.8%服务费，用于展示一种可能原因。", "比率按汇总分子/汇总分母计算，汇总行不取各渠道比率的简单平均。"],
+        "summary": summary,
+        "metrics": [{"label": "统一口径", "value": round(total_metric, 4), "unit": unit}, {"label": "源账认可", "value": round(source_metric_total, 4), "unit": unit}, {"label": "总差额", "value": round(discrepancy, 4), "unit": unit}, {"label": "明细贡献合计", "value": contribution_sum, "unit": unit}],
+        "table": table_list[0],
+        "tables": table_list,
+        "chart": {"type": "bar", "labels": [row["dimension"] for row in (channel_rows if grouping == "channel" else week_rows)], "series": [{"name": "统一口径", "values": [row["computed_metric"] for row in (channel_rows if grouping == "channel" else week_rows)]}, {"name": "源账认可", "values": [row["source_metric"] for row in (channel_rows if grouping == "channel" else week_rows)]}]},
+        "checks": {
+            "unit": unit, "total_difference": target_contribution, "contribution_sum": contribution_sum,
+            "total_amount_difference": target_amount, "amount_difference_sum": amount_sum,
+            "contribution_consistent": contribution_consistent, "amount_difference_consistent": amount_consistent,
+            "rounding_residual": 0.0 if contribution_consistent else round(target_contribution - contribution_sum, 4),
+        },
+        "explanations": {
+            "zero_visits": {"count": len(zero_rows), "groups": len(zero_groups), "rows": zero_rows, "explanation": zero_explanation},
+            "negative_net": {"count": len(negative_rows), "rows": negative_rows, "explanation": negative_explanation},
+        },
+        "findings": findings,
         "method": metadata()["method"], "warnings": list(dict.fromkeys(warnings)),
     }
